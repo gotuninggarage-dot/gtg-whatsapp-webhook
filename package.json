@@ -1,0 +1,1 @@
+{"description":"Go Tuning Garage — WhatsApp Cloud API webhook receiver + panel backend (pure Node, no dependencies)","engines":{"node":">=18"},"main":"server.js","name":"gtg-whatsapp-webhook","scripts":{"start":"node server.js"},"version":"1.0.0"}

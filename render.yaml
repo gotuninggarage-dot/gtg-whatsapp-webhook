@@ -1,0 +1,25 @@
+# Render Blueprint — Go Tuning Garage WhatsApp webhook
+# Deploy with: create a Web Service from the repo containing these files,
+# or "New +" > "Blueprint" and point it at the repo. Free tier.
+# Secrets (WHATSAPP_TOKEN, WEBHOOK_VERIFY_TOKEN, PANEL_KEY) are marked
+# sync: false so Render prompts for them in the dashboard — they are NEVER
+# committed to the repo.
+services:
+  - type: web
+    name: gtg-whatsapp-webhook
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: WEBHOOK_VERIFY_TOKEN
+        sync: false
+      - key: PANEL_KEY
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        value: "1304233306112748"
+      - key: WHATSAPP_WABA_ID
+        value: "1576199787381291"
