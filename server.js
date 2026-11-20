@@ -9,6 +9,8 @@
  * - POST /api/draft  {key, wa_id, message_id, text}  edit a held draft
  * - POST /api/approve {key, wa_id, message_id}   send the stored draft
  * - POST /api/mark-read {key, wa_id}
+ * - POST /api/draft-image {key, wa_id, message_id, image_url, caption}  fetch a web image as a held image draft (sends nothing)
+ * - POST /api/approve-image {key, wa_id, message_id}  upload + send the stored image draft as a reply
  * - GET  /media/:messageId?key=...   serve a downloaded client photo (key-gated)
  * Data is persisted to data/conversations.json (atomic writes).
  * The access token is read from ../whatsapp-credentials.json (server-side only).
@@ -21,6 +23,11 @@
  * and served read-only through GET /media/:messageId?key=<panel_key>.
  * A failed download never breaks message storage, drafting, or the
  * webhook 200 response — the message is stored with media_status 'failed'.
+ * OUTGOING IMAGES (reference photos for clients): a web image is fetched
+ * into media/outgoing/ (JPEG/PNG/WebP only, max 5 MB) as a held draft and
+ * is only sent when Omar/Gunter explicitly approves that image draft.
+ * The web fetch NEVER carries the WhatsApp token (unlike the Meta CDN
+ * download, which requires it) — see httpsGetBuffer's auth option.
  */
 'use strict';
 
@@ -65,6 +72,15 @@ const GRAPH_VERSION = 'v21.0';
 // webhook arrival, never lazily on /media request.
 const MEDIA_GRAPH_VERSION = 'v27.0';
 const MEDIA_DIR = path.join(DIR, 'media');
+const OUTGOING_DIR = path.join(DIR, 'media', 'outgoing');
+const MAX_OUTGOING_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB
+// Outgoing reference photos: JPEG/PNG/WebP only (GIF is not accepted here).
+const OUTGOING_IMAGE_MIMES = {
+  'image/jpeg': true,
+  'image/jpg': true,
+  'image/png': true,
+  'image/webp': true,
+};
 const MEDIA_EXT_BY_MIME = {
   'image/jpeg': 'jpg',
   'image/jpg': 'jpg',
@@ -101,6 +117,7 @@ const BUSINESS = {
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
+if (!fs.existsSync(OUTGOING_DIR)) fs.mkdirSync(OUTGOING_DIR, { recursive: true });
 
 function loadStore() {
   try {
@@ -311,21 +328,33 @@ function graphGetMediaJson(mediaId) {
 // URL may redirect to a CDN host). Meta requires the same Bearer token on
 // the media download itself — without it the CDN answers 401. Rejects on
 // non-2xx, timeout or network error. Returns { buffer, contentType }.
-function httpsGetBuffer(rawUrl, redirectsLeft) {
+// opts: { auth: true } sends the WhatsApp token (Meta CDN only, default);
+// { auth: false } sends no token — REQUIRED for downloads from the open
+// web, where the token must never be disclosed. { maxBytes } aborts the
+// download once the body exceeds that size.
+function httpsGetBuffer(rawUrl, redirectsLeft, opts) {
+  const auth = !opts || opts.auth !== false;
+  const maxBytes = (opts && opts.maxBytes) || 0;
   return new Promise((resolve, reject) => {
     const u = new URL(rawUrl);
-    const req = https.request(
+    // Plain http:// URLs must use the http module; https.request against
+    // one fails the TLS handshake ("wrong version number"). Web image
+    // hosts may serve either scheme (including across redirects).
+    const lib = u.protocol === 'http:' ? http : https;
+    const headers = { 'User-Agent': 'GTG-media/1.0' };
+    if (auth) headers.Authorization = 'Bearer ' + ACCESS_TOKEN;
+    const req = lib.request(
       {
         hostname: u.hostname,
         port: u.port || 443,
         path: u.pathname + u.search,
         method: 'GET',
-        headers: { Authorization: 'Bearer ' + ACCESS_TOKEN, 'User-Agent': 'GTG-media/1.0' },
+        headers: headers,
       },
       (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsLeft > 0) {
           res.resume();
-          resolve(httpsGetBuffer(new URL(res.headers.location, rawUrl).toString(), redirectsLeft - 1));
+          resolve(httpsGetBuffer(new URL(res.headers.location, rawUrl).toString(), redirectsLeft - 1, opts));
           return;
         }
         if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -334,8 +363,21 @@ function httpsGetBuffer(rawUrl, redirectsLeft) {
           return;
         }
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType: res.headers['content-type'] || '' }));
+        let total = 0;
+        let tooLarge = false;
+        res.on('data', (c) => {
+          total += c.length;
+          if (maxBytes > 0 && total > maxBytes) {
+            tooLarge = true;
+            req.destroy(new Error('media download exceeds ' + maxBytes + ' bytes'));
+            return;
+          }
+          chunks.push(c);
+        });
+        res.on('end', () => {
+          if (tooLarge) return;
+          resolve({ buffer: Buffer.concat(chunks), contentType: res.headers['content-type'] || '' });
+        });
       }
     );
     req.setTimeout(6000, () => req.destroy(new Error('media download timed out')));
@@ -433,13 +475,13 @@ async function handleInbound(store, value) {
   });
 }
 
-function graphPost(path, body) {
+function graphPost(path, body, version) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = https.request(
       {
         hostname: 'graph.facebook.com',
-        path: '/' + GRAPH_VERSION + path,
+        path: '/' + (version || GRAPH_VERSION) + path,
         method: 'POST',
         headers: {
           Authorization: 'Bearer ' + ACCESS_TOKEN,
@@ -473,6 +515,75 @@ async function sendWhatsApp(waId, text) {
     type: 'text',
     text: { preview_url: false, body: text },
   });
+}
+
+// Upload a local image file to Meta and return { status, body } where
+// body.id is the media id on success. multipart/form-data, v27.0.
+// The file is read from disk; the token is only ever sent to graph.facebook.com.
+function graphUploadMedia(filePath, mimeType) {
+  return new Promise((resolve, reject) => {
+    let fileBuffer;
+    try {
+      fileBuffer = fs.readFileSync(filePath);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    const boundary = '----GTGMedia' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const head = Buffer.concat([
+      Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="messaging_product"\r\n\r\nwhatsapp\r\n'),
+      Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="type"\r\n\r\n' + mimeType + '\r\n'),
+      Buffer.from(
+        '--' + boundary + '\r\nContent-Disposition: form-data; name="file"; filename="' + path.basename(filePath) + '"\r\nContent-Type: ' + mimeType + '\r\n\r\n'
+      ),
+    ]);
+    const tail = Buffer.from('\r\n--' + boundary + '--\r\n');
+    const body = Buffer.concat([head, fileBuffer, tail]);
+    const req = https.request(
+      {
+        hostname: 'graph.facebook.com',
+        path: '/' + MEDIA_GRAPH_VERSION + '/' + CONFIG.phone_number_id + '/media',
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + ACCESS_TOKEN,
+          'Content-Type': 'multipart/form-data; boundary=' + boundary,
+          'Content-Length': body.length,
+        },
+      },
+      (res) => {
+        let raw = '';
+        res.on('data', (c) => (raw += c));
+        res.on('end', () => {
+          try {
+            resolve({ status: res.statusCode, body: JSON.parse(raw) });
+          } catch (e) {
+            resolve({ status: res.statusCode, body: { raw: raw } });
+          }
+        });
+      }
+    );
+    req.setTimeout(15000, () => req.destroy(new Error('media upload timed out')));
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// Send an image message (by media id) as a reply to an inbound message.
+// v27.0, like the media upload. Caption is optional (max 1024 chars).
+async function sendWhatsAppImage(waId, mediaId, caption, inReplyToId) {
+  const image = { id: mediaId };
+  const cap = String(caption || '').slice(0, 1024);
+  if (cap) image.caption = cap;
+  const body = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: waId,
+    type: 'image',
+    image: image,
+  };
+  if (inReplyToId) body.context = { message_id: inReplyToId };
+  return graphPost('/' + CONFIG.phone_number_id + '/messages', body, MEDIA_GRAPH_VERSION);
 }
 
 function readBody(req) {
@@ -667,6 +778,112 @@ const server = http.createServer(async (req, res) => {
       return json(res, 502, { error: 'Graph API error', detail: result.body });
     } catch (e) {
       console.error('Approve failed:', e);
+      return json(res, 500, { error: String(e) });
+    }
+  }
+
+  // ---- Outgoing image drafts (reference photos for clients) ----
+  // POST /api/draft-image {key, wa_id, message_id, image_url, caption}
+  // Fetches a web image into media/outgoing/ and records it as a held
+  // image draft on the target inbound message. SENDS NOTHING to WhatsApp.
+  // The web fetch never carries the WhatsApp token (auth: false).
+  if (pathname === '/api/draft-image' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (!authorized(req, body)) return json(res, 401, { error: 'unauthorized' });
+    const store = loadStore();
+    const conv = store.conversations[String(body.wa_id || '')];
+    if (!conv) return json(res, 404, { error: 'conversation not found' });
+    const msg = conv.messages.find((m) => m.id === body.message_id);
+    if (!msg) return json(res, 404, { error: 'message not found' });
+    const imageUrl = String(body.image_url || '').trim();
+    let u;
+    try {
+      u = new URL(imageUrl);
+    } catch (e) {
+      return json(res, 400, { error: 'image_url must be a valid URL' });
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      return json(res, 400, { error: 'image_url must be http(s)' });
+    }
+    const caption = String(body.caption || '').slice(0, 1024);
+    let dl;
+    try {
+      dl = await httpsGetBuffer(imageUrl, 5, { auth: false, maxBytes: MAX_OUTGOING_IMAGE_BYTES });
+    } catch (e) {
+      return json(res, 400, { error: 'could not download image', detail: e && e.message ? e.message : String(e) });
+    }
+    const mime = String(dl.contentType || '')
+      .toLowerCase()
+      .split(';')[0]
+      .trim();
+    if (!OUTGOING_IMAGE_MIMES[mime]) {
+      return json(res, 400, { error: 'not a supported image (JPEG, PNG or WebP required)', content_type: mime || 'unknown' });
+    }
+    const ext = MEDIA_EXT_BY_MIME[mime] || 'jpg';
+    const rel = 'media/outgoing/' + mediaBaseName(msg.id) + '.' + ext;
+    // Re-drafting replaces a previous image draft for the same message.
+    if (msg.draft_image_file && msg.draft_image_file !== rel) {
+      try {
+        fs.unlinkSync(path.join(DIR, msg.draft_image_file));
+      } catch (e) {
+        /* best effort */
+      }
+    }
+    fs.writeFileSync(path.join(DIR, rel), dl.buffer);
+    msg.draft_image_url = imageUrl;
+    msg.draft_image_file = rel;
+    msg.draft_image_mime = mime;
+    msg.draft_image_caption = caption;
+    msg.draft_image_status = 'pending';
+    saveStore(store);
+    return json(res, 200, { ok: true, file: rel, bytes: dl.buffer.length, mime: mime });
+  }
+
+  // POST /api/approve-image {key, wa_id, message_id}
+  // Uploads the stored image draft to Meta and sends it as an image
+  // message replying to message_id. Only acts when explicitly called.
+  if (pathname === '/api/approve-image' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (!authorized(req, body)) return json(res, 401, { error: 'unauthorized' });
+    const store = loadStore();
+    const conv = store.conversations[String(body.wa_id || '')];
+    if (!conv) return json(res, 404, { error: 'conversation not found' });
+    const msg = conv.messages.find((m) => m.id === body.message_id);
+    if (!msg || !msg.draft_image_file) return json(res, 404, { error: 'message or image draft not found' });
+    if (msg.draft_image_status === 'sent') return json(res, 409, { error: 'image draft already sent' });
+    const filePath = path.join(DIR, msg.draft_image_file);
+    if (!filePath.startsWith(OUTGOING_DIR + path.sep) || !fs.existsSync(filePath)) {
+      return json(res, 404, { error: 'image file not found' });
+    }
+    const mime = msg.draft_image_mime || 'image/jpeg';
+    try {
+      const up = await graphUploadMedia(filePath, mime);
+      if (!(up.status >= 200 && up.status < 300 && up.body && up.body.id)) {
+        console.error('Graph API media upload error:', up.status, JSON.stringify(up.body));
+        return json(res, 502, { error: 'Graph API error', detail: up.body });
+      }
+      const result = await sendWhatsAppImage(conv.wa_id, up.body.id, msg.draft_image_caption || '', msg.id);
+      if (result.status >= 200 && result.status < 300 && result.body.messages) {
+        msg.draft_image_status = 'sent';
+        conv.messages.push({
+          id: result.body.messages[0].id,
+          direction: 'out',
+          type: 'image',
+          text: msg.draft_image_caption || '',
+          timestamp: new Date().toISOString(),
+          status: 'sent',
+          in_reply_to: msg.id,
+          media_id: up.body.id,
+        });
+        conv.last_message = msg.draft_image_caption || '[Imagen enviada]';
+        conv.last_ts = new Date().toISOString();
+        saveStore(store);
+        return json(res, 200, { ok: true, message_id: result.body.messages[0].id });
+      }
+      console.error('Graph API image send error:', result.status, JSON.stringify(result.body));
+      return json(res, 502, { error: 'Graph API error', detail: result.body });
+    } catch (e) {
+      console.error('Approve-image failed:', e);
       return json(res, 500, { error: String(e) });
     }
   }
