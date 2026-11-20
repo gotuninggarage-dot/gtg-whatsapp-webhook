@@ -9,10 +9,18 @@
  * - POST /api/draft  {key, wa_id, message_id, text}  edit a held draft
  * - POST /api/approve {key, wa_id, message_id}   send the stored draft
  * - POST /api/mark-read {key, wa_id}
+ * - GET  /media/:messageId?key=...   serve a downloaded client photo (key-gated)
  * Data is persisted to data/conversations.json (atomic writes).
  * The access token is read from ../whatsapp-credentials.json (server-side only).
  * DRAFT-ONLY MODE: nothing is ever sent to a client unless Omar/Gunter
  * explicitly press Enviar / Aprobar in the panel.
+ * MEDIA (images only): when an inbound image message arrives, the server
+ * records its media id and downloads the image immediately via the Graph API
+ * (the temporary download URL expires in minutes, so the download happens
+ * at arrival, never lazily). Files are saved under media/ next to this file
+ * and served read-only through GET /media/:messageId?key=<panel_key>.
+ * A failed download never breaks message storage, drafting, or the
+ * webhook 200 response — the message is stored with media_status 'failed'.
  */
 'use strict';
 
@@ -51,6 +59,26 @@ const DATA_DIR = path.join(DIR, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'conversations.json');
 const PORT = parseInt(process.env.PORT || '3100', 10);
 const GRAPH_VERSION = 'v21.0';
+// Media downloads (images only). The Graph media endpoint is queried with
+// v27.0 (the version the webhook subscription uses). The temporary download
+// URL Meta returns expires in minutes, so every image is downloaded at
+// webhook arrival, never lazily on /media request.
+const MEDIA_GRAPH_VERSION = 'v27.0';
+const MEDIA_DIR = path.join(DIR, 'media');
+const MEDIA_EXT_BY_MIME = {
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+};
+const MEDIA_CONTENT_TYPE = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  gif: 'image/gif',
+};
 
 const BUSINESS = {
   name: 'GO TUNING GARAGE',
@@ -72,6 +100,7 @@ const BUSINESS = {
 };
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
 function loadStore() {
   try {
@@ -230,17 +259,132 @@ function getOrCreateConv(store, waId, name) {
   return store.conversations[waId];
 }
 
-function handleInbound(store, value) {
+/* ---- Media download (images only) ---- */
+
+// File-safe base name for a message id. WhatsApp message ids (wamid.*) are
+// base64-ish and may contain '.', '=', '+' or '/'; all of those are mapped
+// to '_' so the name can never escape MEDIA_DIR or split a URL path.
+// The same function is used when saving and when serving, so the mapping
+// is consistent in both directions.
+function mediaBaseName(messageId) {
+  return String(messageId || '').replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
+// GET /{media-id} on the Graph API: returns { url, mime_type, ... } where
+// url is a temporary download URL (expires in minutes). Rejects on any
+// non-2xx status or a response without a url. Never logs the token or url.
+function graphGetMediaJson(mediaId) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'graph.facebook.com',
+        path: '/' + MEDIA_GRAPH_VERSION + '/' + encodeURIComponent(String(mediaId)),
+        method: 'GET',
+        headers: { Authorization: 'Bearer ' + ACCESS_TOKEN },
+      },
+      (res) => {
+        let raw = '';
+        res.on('data', (c) => (raw += c));
+        res.on('end', () => {
+          let body = {};
+          try {
+            body = JSON.parse(raw);
+          } catch (e) {
+            body = {};
+          }
+          if (res.statusCode >= 200 && res.statusCode < 300 && body.url) {
+            resolve(body);
+          } else {
+            const detail = body && body.error && body.error.message ? ': ' + body.error.message : '';
+            reject(new Error('Graph media lookup HTTP ' + res.statusCode + detail));
+          }
+        });
+      }
+    );
+    req.setTimeout(6000, () => req.destroy(new Error('Graph media lookup timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// GET a URL as raw bytes, following up to 5 redirects (the temporary media
+// URL may redirect to a CDN host). Rejects on non-2xx, timeout or network
+// error. Returns { buffer, contentType }.
+function httpsGetBuffer(rawUrl, redirectsLeft) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(rawUrl);
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: 'GET',
+        headers: { 'User-Agent': 'GTG-media/1.0' },
+      },
+      (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsLeft > 0) {
+          res.resume();
+          resolve(httpsGetBuffer(new URL(res.headers.location, rawUrl).toString(), redirectsLeft - 1));
+          return;
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          res.resume();
+          reject(new Error('media download HTTP ' + res.statusCode));
+          return;
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType: res.headers['content-type'] || '' }));
+      }
+    );
+    req.setTimeout(6000, () => req.destroy(new Error('media download timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// Download one inbound image at arrival time and save it under media/ as
+// <sanitized message id>.<ext> (extension from the mime type, default jpg).
+// At most one retry (two attempts total). Never throws: on failure it logs
+// (message id + error only, never the token or the signed URL) and returns
+// { ok: false }. Callers set media_status from the result.
+async function downloadImageMedia(mediaId, messageId) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const meta = await graphGetMediaJson(mediaId);
+      const dl = await httpsGetBuffer(meta.url, 5);
+      const mime = String(meta.mime_type || dl.contentType || '')
+        .toLowerCase()
+        .split(';')[0]
+        .trim();
+      const ext = MEDIA_EXT_BY_MIME[mime] || 'jpg';
+      fs.writeFileSync(path.join(MEDIA_DIR, mediaBaseName(messageId) + '.' + ext), dl.buffer);
+      return { ok: true, ext: ext };
+    } catch (e) {
+      lastError = e;
+      console.error(
+        new Date().toISOString(),
+        'Media download failed (attempt ' + attempt + ') for message ' + messageId + ':',
+        e && e.message ? e.message : e
+      );
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+async function handleInbound(store, value) {
   const contacts = {};
   (value.contacts || []).forEach((c) => {
     contacts[c.wa_id] = (c.profile && c.profile.name) || c.wa_id;
   });
-  (value.messages || []).forEach((m) => {
+  for (const m of value.messages || []) {
     const waId = m.from;
     const conv = getOrCreateConv(store, waId, contacts[waId]);
     const text = extractText(m);
     const cls = classify(text);
-    conv.messages.push({
+    const inboundMsg = {
       id: m.id,
       direction: 'in',
       type: m.type || 'text',
@@ -252,11 +396,34 @@ function handleInbound(store, value) {
       draft_reply: cls.draft,
       draft_status: 'pending', // pending | approved | sent
       status: 'received',
-    });
+    };
+    // Images only: record the media id and the path it will be served from,
+    // then download it right now (the temporary URL expires in minutes).
+    // A failed download only marks the record 'failed' — it never breaks
+    // message storage, drafting, or the webhook 200 response.
+    if (m.type === 'image' && m.image && m.image.id) {
+      inboundMsg.media_id = String(m.image.id);
+      inboundMsg.media_url = '/media/' + encodeURIComponent(m.id);
+      inboundMsg.media_status = 'pending';
+    }
+    conv.messages.push(inboundMsg);
     conv.unread += 1;
     conv.last_message = text;
     conv.last_ts = new Date(parseInt(m.timestamp, 10) * 1000).toISOString();
-  });
+    if (inboundMsg.media_id) {
+      try {
+        const dl = await downloadImageMedia(inboundMsg.media_id, m.id);
+        inboundMsg.media_status = dl.ok ? 'downloaded' : 'failed';
+      } catch (e) {
+        console.error(
+          new Date().toISOString(),
+          'Media download error for message ' + m.id + ':',
+          e && e.message ? e.message : e
+        );
+        inboundMsg.media_status = 'failed';
+      }
+    }
+  }
   (value.statuses || []).forEach((s) => {
     Object.values(store.conversations).forEach((conv) => {
       const msg = conv.messages.find((x) => x.id === s.id);
@@ -386,11 +553,11 @@ const server = http.createServer(async (req, res) => {
     try {
       if (body && body.object === 'whatsapp_business_account') {
         const store = loadStore();
-        (body.entry || []).forEach((entry) => {
-          (entry.changes || []).forEach((change) => {
-            if (change.value) handleInbound(store, change.value);
-          });
-        });
+        for (const entry of body.entry || []) {
+          for (const change of entry.changes || []) {
+            if (change.value) await handleInbound(store, change.value);
+          }
+        }
         saveStore(store);
         console.log(new Date().toISOString(), 'Event stored. Conversations:', Object.keys(store.conversations).length);
       }
@@ -513,6 +680,34 @@ const server = http.createServer(async (req, res) => {
       saveStore(store);
     }
     return json(res, 200, { ok: true });
+  }
+
+  // ---- Serve a downloaded client photo (key-gated, read-only) ----
+  // GET /media/:messageId?key=<panel_key> — the key check is the same as
+  // /api/conversations, but the failure code is 403 per the media contract.
+  // 404 when no downloaded file exists for that message id.
+  if (pathname.startsWith('/media/') && req.method === 'GET') {
+    if (!authorized(req)) return json(res, 403, { error: 'forbidden' });
+    const rawId = decodeURIComponent(pathname.slice('/media/'.length));
+    if (!rawId) return json(res, 404, { error: 'not found' });
+    const base = mediaBaseName(rawId);
+    let filePath = null;
+    for (const ext of ['jpg', 'jpeg', 'png', 'webp', 'gif']) {
+      const candidate = path.join(MEDIA_DIR, base + '.' + ext);
+      if (fs.existsSync(candidate)) {
+        filePath = candidate;
+        break;
+      }
+    }
+    if (!filePath) return json(res, 404, { error: 'not found' });
+    const ext = path.extname(filePath).slice(1).toLowerCase();
+    const data = fs.readFileSync(filePath);
+    res.writeHead(200, {
+      'Content-Type': MEDIA_CONTENT_TYPE[ext] || 'application/octet-stream',
+      'Content-Length': data.length,
+      'Cache-Control': 'private, max-age=60',
+    });
+    return res.end(data);
   }
 
   return json(res, 404, { error: 'not found' });
