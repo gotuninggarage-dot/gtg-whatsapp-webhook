@@ -308,8 +308,9 @@ function graphGetMediaJson(mediaId) {
 }
 
 // GET a URL as raw bytes, following up to 5 redirects (the temporary media
-// URL may redirect to a CDN host). Rejects on non-2xx, timeout or network
-// error. Returns { buffer, contentType }.
+// URL may redirect to a CDN host). Meta requires the same Bearer token on
+// the media download itself — without it the CDN answers 401. Rejects on
+// non-2xx, timeout or network error. Returns { buffer, contentType }.
 function httpsGetBuffer(rawUrl, redirectsLeft) {
   return new Promise((resolve, reject) => {
     const u = new URL(rawUrl);
@@ -319,7 +320,7 @@ function httpsGetBuffer(rawUrl, redirectsLeft) {
         port: u.port || 443,
         path: u.pathname + u.search,
         method: 'GET',
-        headers: { 'User-Agent': 'GTG-media/1.0' },
+        headers: { Authorization: 'Bearer ' + ACCESS_TOKEN, 'User-Agent': 'GTG-media/1.0' },
       },
       (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsLeft > 0) {
