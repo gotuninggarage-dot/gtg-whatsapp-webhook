@@ -11,16 +11,19 @@
  * - POST /api/mark-read {key, wa_id}
  * - POST /api/draft-image {key, wa_id, message_id, image_url, caption}  fetch a web image as a held image draft (sends nothing)
  * - POST /api/approve-image {key, wa_id, message_id}  upload + send the stored image draft as a reply
- * - GET  /media/:messageId?key=...   serve a downloaded client photo (key-gated)
+ * - GET  /media/:messageId?key=...   serve a downloaded client photo or voice note (key-gated)
  * Data is persisted to data/conversations.json (atomic writes).
  * The access token is read from ../whatsapp-credentials.json (server-side only).
  * DRAFT-ONLY MODE: nothing is ever sent to a client unless Omar/Gunter
  * explicitly press Enviar / Aprobar in the panel.
- * MEDIA (images only): when an inbound image message arrives, the server
- * records its media id and downloads the image immediately via the Graph API
- * (the temporary download URL expires in minutes, so the download happens
- * at arrival, never lazily). Files are saved under media/ next to this file
- * and served read-only through GET /media/:messageId?key=<panel_key>.
+ * MEDIA (images + audio): when an inbound image or audio message arrives,
+ * the server records its media id and downloads the file immediately via
+ * the Graph API (the temporary download URL expires in minutes, so the
+ * download happens at arrival, never lazily). Files are saved under media/
+ * next to this file and served read-only through
+ * GET /media/:messageId?key=<panel_key>. Audio is a voice note (WhatsApp
+ * sends audio/ogg, Opus); Ronin transcribes it locally, the server only
+ * stores and serves the file.
  * A failed download never breaks message storage, drafting, or the
  * webhook 200 response — the message is stored with media_status 'failed'.
  * OUTGOING IMAGES (reference photos for clients): a web image is fetched
@@ -66,10 +69,10 @@ const DATA_DIR = path.join(DIR, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'conversations.json');
 const PORT = parseInt(process.env.PORT || '3100', 10);
 const GRAPH_VERSION = 'v21.0';
-// Media downloads (images only). The Graph media endpoint is queried with
+// Media downloads (images + audio). The Graph media endpoint is queried with
 // v27.0 (the version the webhook subscription uses). The temporary download
-// URL Meta returns expires in minutes, so every image is downloaded at
-// webhook arrival, never lazily on /media request.
+// URL Meta returns expires in minutes, so every image and audio file is
+// downloaded at webhook arrival, never lazily on /media request.
 const MEDIA_GRAPH_VERSION = 'v27.0';
 const MEDIA_DIR = path.join(DIR, 'media');
 const OUTGOING_DIR = path.join(DIR, 'media', 'outgoing');
@@ -87,6 +90,18 @@ const MEDIA_EXT_BY_MIME = {
   'image/png': 'png',
   'image/webp': 'webp',
   'image/gif': 'gif',
+  // Audio: WhatsApp voice notes arrive as audio/ogg (Opus). Other audio
+  // types a client might send as a file.
+  'audio/ogg': 'ogg',
+  'audio/opus': 'opus',
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/aac': 'aac',
+  'audio/amr': 'amr',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/webm': 'webm',
 };
 const MEDIA_CONTENT_TYPE = {
   jpg: 'image/jpeg',
@@ -94,6 +109,14 @@ const MEDIA_CONTENT_TYPE = {
   png: 'image/png',
   webp: 'image/webp',
   gif: 'image/gif',
+  ogg: 'audio/ogg',
+  opus: 'audio/ogg',
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  amr: 'audio/amr',
+  wav: 'audio/wav',
+  webm: 'audio/webm',
 };
 
 const BUSINESS = {
@@ -386,12 +409,13 @@ function httpsGetBuffer(rawUrl, redirectsLeft, opts) {
   });
 }
 
-// Download one inbound image at arrival time and save it under media/ as
-// <sanitized message id>.<ext> (extension from the mime type, default jpg).
-// At most one retry (two attempts total). Never throws: on failure it logs
-// (message id + error only, never the token or the signed URL) and returns
-// { ok: false }. Callers set media_status from the result.
-async function downloadImageMedia(mediaId, messageId) {
+// Download one inbound image or audio file at arrival time and save it
+// under media/ as <sanitized message id>.<ext> (extension from the mime
+// type, default jpg). At most one retry (two attempts total). Never throws:
+// on failure it logs (message id + error only, never the token or the
+// signed URL) and returns { ok: false }. Callers set media_status from
+// the result.
+async function downloadInboundMedia(mediaId, messageId) {
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -440,12 +464,17 @@ async function handleInbound(store, value) {
       draft_status: 'pending', // pending | approved | sent
       status: 'received',
     };
-    // Images only: record the media id and the path it will be served from,
-    // then download it right now (the temporary URL expires in minutes).
-    // A failed download only marks the record 'failed' — it never breaks
-    // message storage, drafting, or the webhook 200 response.
+    // Images and audio: record the media id and the path it will be served
+    // from, then download it right now (the temporary URL expires in
+    // minutes). A failed download only marks the record 'failed' — it never
+    // breaks message storage, drafting, or the webhook 200 response.
     if (m.type === 'image' && m.image && m.image.id) {
       inboundMsg.media_id = String(m.image.id);
+      inboundMsg.media_url = '/media/' + encodeURIComponent(m.id);
+      inboundMsg.media_status = 'pending';
+    }
+    if (m.type === 'audio' && m.audio && m.audio.id) {
+      inboundMsg.media_id = String(m.audio.id);
       inboundMsg.media_url = '/media/' + encodeURIComponent(m.id);
       inboundMsg.media_status = 'pending';
     }
@@ -455,7 +484,7 @@ async function handleInbound(store, value) {
     conv.last_ts = new Date(parseInt(m.timestamp, 10) * 1000).toISOString();
     if (inboundMsg.media_id) {
       try {
-        const dl = await downloadImageMedia(inboundMsg.media_id, m.id);
+        const dl = await downloadInboundMedia(inboundMsg.media_id, m.id);
         inboundMsg.media_status = dl.ok ? 'downloaded' : 'failed';
       } catch (e) {
         console.error(
@@ -900,7 +929,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true });
   }
 
-  // ---- Serve a downloaded client photo (key-gated, read-only) ----
+  // ---- Serve a downloaded client photo or voice note (key-gated, read-only) ----
   // GET /media/:messageId?key=<panel_key> — the key check is the same as
   // /api/conversations, but the failure code is 403 per the media contract.
   // 404 when no downloaded file exists for that message id.
@@ -910,7 +939,7 @@ const server = http.createServer(async (req, res) => {
     if (!rawId) return json(res, 404, { error: 'not found' });
     const base = mediaBaseName(rawId);
     let filePath = null;
-    for (const ext of ['jpg', 'jpeg', 'png', 'webp', 'gif']) {
+    for (const ext of ['jpg', 'jpeg', 'png', 'webp', 'gif', 'ogg', 'opus', 'mp3', 'm4a', 'aac', 'amr', 'wav', 'webm']) {
       const candidate = path.join(MEDIA_DIR, base + '.' + ext);
       if (fs.existsSync(candidate)) {
         filePath = candidate;
