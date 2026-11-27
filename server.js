@@ -16,8 +16,9 @@
  * The access token is read from ../whatsapp-credentials.json (server-side only).
  * SEND MODE (controlled test, restricted): automatic replies are enabled
  * ONLY for the test numbers in AUTO_SEND_ALLOWLIST (5215660419427 Omar,
- * 5217716013896 Gunter): the official greeting for greetings, and the
- * holding ack ("ya te atiendo") for queries that need Ronin's analysis.
+ * 5217716013896 Gunter): the official greeting for greetings ONLY.
+  * No holding ack is sent (removed 2026-11-27 per Omar) — for any other
+   * message the worker's full reply is the only response.
  * Every other number stays DRAFT-ONLY: nothing is sent unless Omar/Gunter
  * explicitly press Enviar / Aprobar in the panel. Sensitive topics (price,
  * complaints, delays, extras, human handoff, cancellations) are never
@@ -491,11 +492,8 @@ async function downloadInboundMedia(mediaId, messageId) {
  * AUTO_SEND_ALLOWLIST (checked first, before any send), and at most once
  * per inbound message. Exactly one automatic reply per inbound message:
  *  - greeting            -> official BUSINESS.greeting, sent immediately.
- *  - needs_approval=true -> BUSINESS.holdingReply, but ONLY if no holding
- *    ack is already outstanding for this conversation (conv.awaiting_ronin).
- *    Sending it sets conv.awaiting_ronin = true until Ronin answers via
- *    /api/send or /api/approve, which clears it for a new cycle.
- *  - any other category  -> no automatic send; the draft stays pending.
+ *  - any other category  -> no automatic send; the draft stays pending
+  *    for the worker's full reply (no holding ack — removed 2026-11-27).
  * At-most-once: BEFORE the Graph API call, auto_reply_attempted=true and
  * auto_reply_attempted_at are persisted to the store. A message with that
  * marker never triggers another automatic send — even if the first attempt
@@ -521,14 +519,10 @@ async function tryAutoReply(store, conv, inboundMsg, cls) {
   let text = null;
   if (cls.category === 'greeting') {
     text = BUSINESS.greeting;
-  } else if (cls.needs_approval) {
-    if (conv.awaiting_ronin === true) {
-      console.log(new Date().toISOString(), 'AUTO-SEND skipped (ack outstanding):', inboundMsg.id);
-      return;
-    }
-    text = BUSINESS.holdingReply;
   } else {
-    return;
+        // No holding ack (removed 2026-11-27 per Omar): for any other message
+        // the worker's full reply is the only response; nothing is sent here.
+        return;
   }
   // Crash-safe attempt marker: persist BEFORE the network call, so a crash
   // (or a Meta redelivery) between here and the send can never produce a
