@@ -14,8 +14,28 @@
  * - GET  /media/:messageId?key=...   serve a downloaded client photo or voice note (key-gated)
  * Data is persisted to data/conversations.json (atomic writes).
  * The access token is read from ../whatsapp-credentials.json (server-side only).
- * DRAFT-ONLY MODE: nothing is ever sent to a client unless Omar/Gunter
- * explicitly press Enviar / Aprobar in the panel.
+ * SEND MODE (controlled test, restricted): automatic replies are enabled
+ * ONLY for the test numbers in AUTO_SEND_ALLOWLIST (5215660419427 Omar,
+ * 5217716013896 Gunter): the official greeting for greetings, and the
+ * holding ack ("ya te atiendo") for queries that need Ronin's analysis.
+ * Every other number stays DRAFT-ONLY: nothing is sent unless Omar/Gunter
+ * explicitly press Enviar / Aprobar in the panel. Sensitive topics (price,
+ * complaints, delays, extras, human handoff, cancellations) are never
+ * answered automatically — they only get the holding ack and stay pending
+ * approval.
+ * Safety: all store read-modify-write sequences run through a single
+ * in-process queue (withStore), and every automatic send is at-most-once:
+ * an attempt marker (auto_reply_attempted) is persisted BEFORE the Graph
+ * API call, and a message with that marker never triggers another
+ * automatic send, even if the first attempt failed.
+ * WORKER CONTRACT (full auto-replies, controlled test only): when the
+ * server auto-sends, it records auto_sent_kind ('greeting' | 'holding')
+ * and auto_sent_text on the inbound message, visible via
+ * GET /api/conversations. The hook worker drafts ONLY the follow-up for
+ * greetings (e.g. the name question) instead of repeating the greeting;
+ * for holding cases the worker's auto-approved draft is the full reply.
+ * The worker uses /api/draft + /api/approve on the same message_id —
+ * a second approve after a sent draft sends the new text.
  * MEDIA (images + audio): when an inbound image or audio message arrives,
  * the server records its media id and downloads the file immediately via
  * the Graph API (the temporary download URL expires in minutes, so the
@@ -118,7 +138,6 @@ const MEDIA_CONTENT_TYPE = {
   wav: 'audio/wav',
   webm: 'audio/webm',
 };
-
 const BUSINESS = {
   name: 'GO TUNING GARAGE',
   city: 'Pachuca, Hidalgo',
@@ -129,7 +148,7 @@ const BUSINESS = {
   phone: CONFIG.number,
   services: ['PPF', 'WRAP', 'Polarizado', 'Body kits', 'Radios multimedia', 'Iluminación', 'Equipamiento off-road'],
   greeting:
-    'Hola, soy Ronin, asistente de GO TUNING GARAGE en Pachuca. Te ayudamos con personalización automotriz: PPF, WRAP, polarizado, body kits, radios multimedia, iluminación y equipamiento off-road. Cuéntame, ¿qué vehículo tienes y qué te gustaría realizarle?',
+    '¡Hola! 👋 ¡Bienvenido a *GO TUNING GARAGE | PACHUCA* 🔧\n\nSoy *Ronin*, asistente virtual del taller. Estoy aquí para ayudarte a personalizar, proteger y equipar tu vehículo. 🏎️\n\nTrabajamos con:\n\n• PPF y WRAP\n• Body Kits y modificaciones estéticas\n• Iluminación y ambientación interior\n• Sistemas multimedia con Android Auto y Apple CarPlay\n• Polarizado\n• Equipamiento y accesorios off-road\n\nCuéntame, ¿qué vehículo tienes y qué te gustaría hacerle?\n\nSi tienes alguna fotografía o referencia de lo que buscas, puedes compartirla para orientarte mejor.',
   noPriceReply:
     'Para darte una cotización correcta, primero necesitamos conocer tu vehículo y revisar exactamente lo que deseas realizar. En GO TUNING GARAGE hacemos una valoración gratuita y sin compromiso en nuestro taller; después de revisar tu proyecto podremos definir los materiales, el alcance del trabajo y presentarte una cotización adecuada.',
   valuationInvite:
@@ -137,6 +156,12 @@ const BUSINESS = {
   holdingReply:
     'Gracias por tu mensaje. Estamos revisando tu caso con el equipo del taller y te confirmamos en breve.',
 };
+
+/* Auto-send allowlist (CONTROLLED TEST ONLY). Only these wa_ids may receive
+ * automatic replies. The allowlist is checked BEFORE any automatic send;
+ * every other number stays draft-only. Expand/remove only with Omar's
+ * explicit authorization after the controlled tests pass. */
+const AUTO_SEND_ALLOWLIST = ['5215660419427', '5217716013896'];
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
@@ -156,6 +181,24 @@ function saveStore(store) {
   fs.renameSync(tmp, DATA_FILE);
 }
 
+/* Serialize every store read-modify-write sequence through a single
+ * in-process promise chain. Node serves requests concurrently, so without
+ * this two POST /webhook deliveries (or a webhook racing /api/send) could
+ * interleave: both load the same store, both pass the dedup check, and the
+ * last save wins — losing a message or sending a duplicate auto-reply.
+ * Every write path (POST /webhook, /api/send, /api/draft, /api/approve,
+ * /api/mark-read) runs inside withStore, so the dedup check, the
+ * auto_reply_attempted/sent marking and the awaiting_ronin update are
+ * atomic with respect to other requests. Read-only GETs stay outside the
+ * queue (saveStore writes atomically via rename, so a reader sees either
+ * the old or the new file, never a torn one). */
+let storeQueue = Promise.resolve();
+function withStore(fn) {
+  const run = storeQueue.then(fn, fn);
+  storeQueue = run.catch(() => {});
+  return run;
+}
+
 function norm(s) {
   return (s || '')
     .toLowerCase()
@@ -164,7 +207,6 @@ function norm(s) {
 }
 
 const HAS = (text, words) => words.some((w) => norm(text).includes(norm(w)));
-
 /* Classify an inbound client message per the operative document + checklist §3.
  * Returns { category, needs_approval, reason, draft }.
  * Categories: greeting | service | price | scheduling | confirm | routine
@@ -269,7 +311,6 @@ function classify(text) {
     draft: BUSINESS.holdingReply,
   };
 }
-
 function extractText(msg) {
   if (!msg) return '';
   if (msg.type === 'text' && msg.text) return msg.text.body || '';
@@ -346,7 +387,6 @@ function graphGetMediaJson(mediaId) {
     req.end();
   });
 }
-
 // GET a URL as raw bytes, following up to 5 redirects (the temporary media
 // URL may redirect to a CDN host). Meta requires the same Bearer token on
 // the media download itself — without it the CDN answers 401. Rejects on
@@ -440,7 +480,92 @@ async function downloadInboundMedia(mediaId, messageId) {
   }
   return { ok: false, error: lastError };
 }
-
+/* Restricted automatic reply (TEST PHASE ONLY).
+ * Runs only for inbound messages, only when the conversation's wa_id is in
+ * AUTO_SEND_ALLOWLIST (checked first, before any send), and at most once
+ * per inbound message. Exactly one automatic reply per inbound message:
+ *  - greeting            -> official BUSINESS.greeting, sent immediately.
+ *  - needs_approval=true -> BUSINESS.holdingReply, but ONLY if no holding
+ *    ack is already outstanding for this conversation (conv.awaiting_ronin).
+ *    Sending it sets conv.awaiting_ronin = true until Ronin answers via
+ *    /api/send or /api/approve, which clears it for a new cycle.
+ *  - any other category  -> no automatic send; the draft stays pending.
+ * At-most-once: BEFORE the Graph API call, auto_reply_attempted=true and
+ * auto_reply_attempted_at are persisted to the store. A message with that
+ * marker never triggers another automatic send — even if the first attempt
+ * failed (no automatic retry; the draft stays pending for Omar/Gunter/
+ * Ronin). auto_reply_sent / auto_reply_at / auto_reply_message_id are set
+ * ONLY when Graph API answers success (2xx with messages[0].id).
+ * auto_sent_kind/auto_sent_text record what was sent (for the hook worker).
+ * MUST be called from inside a withStore section (it saves the store
+ * directly); never call it from outside the queue.
+ */
+async function tryAutoReply(store, conv, inboundMsg, cls) {
+  if (!AUTO_SEND_ALLOWLIST.includes(conv.wa_id)) {
+    console.log(new Date().toISOString(), 'AUTO-SEND skipped (not allowlisted):', conv.wa_id, inboundMsg.id);
+    return;
+  }
+  // At-most-once: a message that already had an automatic-send attempt
+  // (succeeded or failed) never triggers another one. A failed attempt
+  // leaves the draft pending for human approval / Ronin — no auto retry.
+  if (inboundMsg.auto_reply_sent || inboundMsg.auto_reply_attempted) {
+    console.log(new Date().toISOString(), 'AUTO-SEND skipped (already attempted):', inboundMsg.id);
+    return;
+  }
+  let text = null;
+  if (cls.category === 'greeting') {
+    text = BUSINESS.greeting;
+  } else if (cls.needs_approval) {
+    if (conv.awaiting_ronin === true) {
+      console.log(new Date().toISOString(), 'AUTO-SEND skipped (ack outstanding):', inboundMsg.id);
+      return;
+    }
+    text = BUSINESS.holdingReply;
+  } else {
+    return;
+  }
+  // Crash-safe attempt marker: persist BEFORE the network call, so a crash
+  // (or a Meta redelivery) between here and the send can never produce a
+  // second automatic send for this message.
+  inboundMsg.auto_reply_attempted = true;
+  inboundMsg.auto_reply_attempted_at = new Date().toISOString();
+  saveStore(store);
+  console.log(new Date().toISOString(), 'AUTO-SEND attempt:', conv.wa_id, cls.category, inboundMsg.id);
+  try {
+    const result = await sendWhatsApp(conv.wa_id, text);
+    if (result.status >= 200 && result.status < 300 && result.body.messages) {
+      const mid = result.body.messages[0].id;
+      inboundMsg.auto_reply_sent = true;
+      inboundMsg.auto_reply_at = new Date().toISOString();
+      inboundMsg.auto_reply_message_id = mid;
+      // Worker contract: record WHAT was auto-sent, so the hook worker can
+      // see it via GET /api/conversations and draft only the follow-up
+      // (greeting -> name question) instead of repeating the greeting.
+      // Holding cases get the full reply from the worker instead.
+      inboundMsg.auto_sent_kind = cls.category === 'greeting' ? 'greeting' : 'holding';
+      inboundMsg.auto_sent_text = text;
+      inboundMsg.draft_status = 'sent';
+      if (cls.needs_approval) conv.awaiting_ronin = true;
+      conv.messages.push({
+        id: mid,
+        direction: 'out',
+        type: 'text',
+        text: text,
+        timestamp: new Date().toISOString(),
+        status: 'sent',
+        in_reply_to: inboundMsg.id,
+      });
+      conv.last_message = text;
+      conv.last_ts = new Date().toISOString();
+      saveStore(store);
+      console.log(new Date().toISOString(), 'AUTO-SEND sent:', mid);
+    } else {
+      console.error(new Date().toISOString(), 'AUTO-SEND failed (draft stays pending, no retry):', result.status, JSON.stringify(result.body));
+    }
+  } catch (e) {
+    console.error(new Date().toISOString(), 'AUTO-SEND error (draft stays pending, no retry):', String(e));
+  }
+}
 async function handleInbound(store, value) {
   const contacts = {};
   (value.contacts || []).forEach((c) => {
@@ -449,6 +574,11 @@ async function handleInbound(store, value) {
   for (const m of value.messages || []) {
     const waId = m.from;
     const conv = getOrCreateConv(store, waId, contacts[waId]);
+    // Dedup: ignore Meta redeliveries of a message we already stored.
+    if (conv.messages.some((x) => x.id === m.id)) {
+      console.log(new Date().toISOString(), 'Duplicate inbound ignored:', m.id);
+      continue;
+    }
     const text = extractText(m);
     const cls = classify(text);
     const inboundMsg = {
@@ -495,6 +625,11 @@ async function handleInbound(store, value) {
         inboundMsg.media_status = 'failed';
       }
     }
+    // Restricted auto-reply (allowlisted test numbers only). Runs after
+    // the media download so the file is already saved when the reply
+    // goes out. Awaits the Graph API result so the store is saved
+    // consistently afterwards.
+    await tryAutoReply(store, conv, inboundMsg, cls);
   }
   (value.statuses || []).forEach((s) => {
     Object.values(store.conversations).forEach((conv) => {
@@ -545,7 +680,6 @@ async function sendWhatsApp(waId, text) {
     text: { preview_url: false, body: text },
   });
 }
-
 // Upload a local image file to Meta and return { status, body } where
 // body.id is the media id on success. multipart/form-data, v27.0.
 // The file is read from disk; the token is only ever sent to graph.facebook.com.
@@ -660,7 +794,6 @@ function sortedConversations(store) {
     }))
     .sort((a, b) => new Date(b.last_ts) - new Date(a.last_ts));
 }
-
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const pathname = url.pathname;
@@ -693,14 +826,18 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     try {
       if (body && body.object === 'whatsapp_business_account') {
-        const store = loadStore();
-        for (const entry of body.entry || []) {
-          for (const change of entry.changes || []) {
-            if (change.value) await handleInbound(store, change.value);
+        // Serialized: the whole load -> handleInbound (incl. auto-reply)
+        // -> save sequence is atomic with respect to other requests.
+        await withStore(async () => {
+          const store = loadStore();
+          for (const entry of body.entry || []) {
+            for (const change of entry.changes || []) {
+              if (change.value) await handleInbound(store, change.value);
+            }
           }
-        }
-        saveStore(store);
-        console.log(new Date().toISOString(), 'Event stored. Conversations:', Object.keys(store.conversations).length);
+          saveStore(store);
+          console.log(new Date().toISOString(), 'Event stored. Conversations:', Object.keys(store.conversations).length);
+        });
       }
     } catch (e) {
       console.error('Error handling webhook event:', e);
@@ -738,79 +875,103 @@ const server = http.createServer(async (req, res) => {
     const text = String(body.text || '').trim();
     if (!waId || !text) return json(res, 400, { error: 'wa_id and text are required' });
     try {
-      const result = await sendWhatsApp(waId, text);
-      if (result.status >= 200 && result.status < 300 && result.body.messages) {
-        const store = loadStore();
-        const conv = getOrCreateConv(store, waId);
-        const mid = result.body.messages[0].id;
-        conv.messages.push({
-          id: mid,
-          direction: 'out',
-          type: 'text',
-          text: text,
-          timestamp: new Date().toISOString(),
-          status: 'sent',
-        });
-        conv.last_message = text;
-        conv.last_ts = new Date().toISOString();
-        saveStore(store);
-        return json(res, 200, { ok: true, message_id: mid });
-      }
-      console.error('Graph API send error:', result.status, JSON.stringify(result.body));
-      return json(res, 502, { error: 'Graph API error', detail: result.body });
+      // Serialized with the webhook path: the Graph call and the store
+      // recording happen atomically with respect to other requests.
+      // The callback returns {code, obj}; the response is sent HERE, in the
+      // handler, so control never falls through to the final 404.
+      const out = await withStore(async () => {
+        const result = await sendWhatsApp(waId, text);
+        if (result.status >= 200 && result.status < 300 && result.body.messages) {
+          const store = loadStore();
+          const conv = getOrCreateConv(store, waId);
+          const mid = result.body.messages[0].id;
+          conv.messages.push({
+            id: mid,
+            direction: 'out',
+            type: 'text',
+            text: text,
+            timestamp: new Date().toISOString(),
+            status: 'sent',
+          });
+          conv.awaiting_ronin = false; // Ronin's reply releases the outstanding holding ack.
+          conv.last_message = text;
+          conv.last_ts = new Date().toISOString();
+          saveStore(store);
+          return { code: 200, obj: { ok: true, message_id: mid } };
+        }
+        console.error('Graph API send error:', result.status, JSON.stringify(result.body));
+        return { code: 502, obj: { error: 'Graph API error', detail: result.body } };
+      });
+      return json(res, out.code, out.obj);
     } catch (e) {
       console.error('Send failed:', e);
-      return json(res, 500, { error: String(e) });
+      if (!res.headersSent) return json(res, 500, { error: String(e) });
     }
   }
-
   if (pathname === '/api/draft' && req.method === 'POST') {
     const body = await readBody(req);
     if (!authorized(req, body)) return json(res, 401, { error: 'unauthorized' });
-    const store = loadStore();
-    const conv = store.conversations[String(body.wa_id || '')];
-    if (!conv) return json(res, 404, { error: 'conversation not found' });
-    const msg = conv.messages.find((m) => m.id === body.message_id);
-    if (!msg) return json(res, 404, { error: 'message not found' });
-    msg.draft_reply = String(body.text || '');
-    saveStore(store);
-    return json(res, 200, { ok: true });
+    try {
+      // The callback returns {code, obj}; the response is sent HERE, in the
+      // handler, so control never falls through to the final 404.
+      const out = await withStore(async () => {
+        const store = loadStore();
+        const conv = store.conversations[String(body.wa_id || '')];
+        if (!conv) return { code: 404, obj: { error: 'conversation not found' } };
+        const msg = conv.messages.find((m) => m.id === body.message_id);
+        if (!msg) return { code: 404, obj: { error: 'message not found' } };
+        msg.draft_reply = String(body.text || '');
+        saveStore(store);
+        return { code: 200, obj: { ok: true } };
+      });
+      return json(res, out.code, out.obj);
+    } catch (e) {
+      console.error('Draft failed:', e);
+      if (!res.headersSent) return json(res, 500, { error: String(e) });
+    }
   }
 
   if (pathname === '/api/approve' && req.method === 'POST') {
     const body = await readBody(req);
     if (!authorized(req, body)) return json(res, 401, { error: 'unauthorized' });
-    const store = loadStore();
-    const conv = store.conversations[String(body.wa_id || '')];
-    if (!conv) return json(res, 404, { error: 'conversation not found' });
-    const msg = conv.messages.find((m) => m.id === body.message_id);
-    if (!msg || !msg.draft_reply) return json(res, 404, { error: 'message or draft not found' });
     try {
-      const result = await sendWhatsApp(conv.wa_id, msg.draft_reply);
-      if (result.status >= 200 && result.status < 300 && result.body.messages) {
-        msg.draft_status = 'sent';
-        conv.messages.push({
-          id: result.body.messages[0].id,
-          direction: 'out',
-          type: 'text',
-          text: msg.draft_reply,
-          timestamp: new Date().toISOString(),
-          status: 'sent',
-          in_reply_to: msg.id,
-        });
-        conv.last_message = msg.draft_reply;
-        conv.last_ts = new Date().toISOString();
-        saveStore(store);
-        return json(res, 200, { ok: true, message_id: result.body.messages[0].id });
-      }
-      console.error('Graph API approve-send error:', result.status, JSON.stringify(result.body));
-      return json(res, 502, { error: 'Graph API error', detail: result.body });
+      // Serialized with the webhook path: the Graph call and the store
+      // recording happen atomically with respect to other requests.
+      // The callback returns {code, obj}; the response is sent HERE, in the
+      // handler, so control never falls through to the final 404.
+      const out = await withStore(async () => {
+        const store = loadStore();
+        const conv = store.conversations[String(body.wa_id || '')];
+        if (!conv) return { code: 404, obj: { error: 'conversation not found' } };
+        const msg = conv.messages.find((m) => m.id === body.message_id);
+        if (!msg || !msg.draft_reply) return { code: 404, obj: { error: 'message or draft not found' } };
+        const result = await sendWhatsApp(conv.wa_id, msg.draft_reply);
+        if (result.status >= 200 && result.status < 300 && result.body.messages) {
+          msg.draft_status = 'sent';
+          conv.messages.push({
+            id: result.body.messages[0].id,
+            direction: 'out',
+            type: 'text',
+            text: msg.draft_reply,
+            timestamp: new Date().toISOString(),
+            status: 'sent',
+            in_reply_to: msg.id,
+          });
+          conv.awaiting_ronin = false; // Approved reply releases the outstanding holding ack.
+          conv.last_message = msg.draft_reply;
+          conv.last_ts = new Date().toISOString();
+          saveStore(store);
+          return { code: 200, obj: { ok: true, message_id: result.body.messages[0].id } };
+        }
+        console.error('Graph API approve-send error:', result.status, JSON.stringify(result.body));
+        return { code: 502, obj: { error: 'Graph API error', detail: result.body } };
+      });
+      return json(res, out.code, out.obj);
     } catch (e) {
       console.error('Approve failed:', e);
-      return json(res, 500, { error: String(e) });
+      if (!res.headersSent) return json(res, 500, { error: String(e) });
     }
   }
-
   // ---- Outgoing image drafts (reference photos for clients) ----
   // POST /api/draft-image {key, wa_id, message_id, image_url, caption}
   // Fetches a web image into media/outgoing/ and records it as a held
@@ -867,7 +1028,6 @@ const server = http.createServer(async (req, res) => {
     saveStore(store);
     return json(res, 200, { ok: true, file: rel, bytes: dl.buffer.length, mime: mime });
   }
-
   // POST /api/approve-image {key, wa_id, message_id}
   // Uploads the stored image draft to Meta and sends it as an image
   // message replying to message_id. Only acts when explicitly called.
@@ -894,6 +1054,7 @@ const server = http.createServer(async (req, res) => {
       const result = await sendWhatsAppImage(conv.wa_id, up.body.id, msg.draft_image_caption || '', msg.id);
       if (result.status >= 200 && result.status < 300 && result.body.messages) {
         msg.draft_image_status = 'sent';
+        conv.awaiting_ronin = false; // Approved reply releases the outstanding holding ack.
         conv.messages.push({
           id: result.body.messages[0].id,
           direction: 'out',
@@ -916,17 +1077,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, 500, { error: String(e) });
     }
   }
-
   if (pathname === '/api/mark-read' && req.method === 'POST') {
     const body = await readBody(req);
     if (!authorized(req, body)) return json(res, 401, { error: 'unauthorized' });
-    const store = loadStore();
-    const conv = store.conversations[String(body.wa_id || '')];
-    if (conv) {
-      conv.unread = 0;
-      saveStore(store);
+    try {
+      // The callback returns {code, obj}; the response is sent HERE, in the
+      // handler, so control never falls through to the final 404.
+      const out = await withStore(async () => {
+        const store = loadStore();
+        const conv = store.conversations[String(body.wa_id || '')];
+        if (conv) {
+          conv.unread = 0;
+          saveStore(store);
+        }
+        return { code: 200, obj: { ok: true } };
+      });
+      return json(res, out.code, out.obj);
+    } catch (e) {
+      console.error('Mark-read failed:', e);
+      if (!res.headersSent) return json(res, 500, { error: String(e) });
     }
-    return json(res, 200, { ok: true });
   }
 
   // ---- Serve a downloaded client photo or voice note (key-gated, read-only) ----
@@ -957,7 +1127,9 @@ const server = http.createServer(async (req, res) => {
     return res.end(data);
   }
 
-  return json(res, 404, { error: 'not found' });
+  // Safety net: a handler that already answered must never reach this line
+  // (a second write would throw ERR_HTTP_HEADERS_SENT and crash the process).
+  if (!res.headersSent) return json(res, 404, { error: 'not found' });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
