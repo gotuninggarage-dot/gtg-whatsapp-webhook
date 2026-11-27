@@ -31,9 +31,10 @@
  * WORKER CONTRACT (full auto-replies, controlled test only): when the
  * server auto-sends, it records auto_sent_kind ('greeting' | 'holding')
  * and auto_sent_text on the inbound message, visible via
- * GET /api/conversations. The hook worker drafts ONLY the follow-up for
- * greetings (e.g. the name question) instead of repeating the greeting;
- * for holding cases the worker's auto-approved draft is the full reply.
+ * GET /api/conversations. The greeting already includes the name
+ * question, so for greetings the worker drafts nothing (the first contact
+ * is complete); for holding cases the worker's auto-approved draft is
+ * the full reply.
  * The worker uses /api/draft + /api/approve on the same message_id —
  * a second approve after a sent draft sends the new text.
  * MEDIA (images + audio): when an inbound image or audio message arrives,
@@ -138,6 +139,7 @@ const MEDIA_CONTENT_TYPE = {
   wav: 'audio/wav',
   webm: 'audio/webm',
 };
+
 const BUSINESS = {
   name: 'GO TUNING GARAGE',
   city: 'Pachuca, Hidalgo',
@@ -148,7 +150,7 @@ const BUSINESS = {
   phone: CONFIG.number,
   services: ['PPF', 'WRAP', 'Polarizado', 'Body kits', 'Radios multimedia', 'Iluminación', 'Equipamiento off-road'],
   greeting:
-    '¡Hola! 👋 ¡Bienvenido a *GO TUNING GARAGE | PACHUCA* 🔧\n\nSoy *Ronin*, asistente virtual del taller. Estoy aquí para ayudarte a personalizar, proteger y equipar tu vehículo. 🏎️\n\nTrabajamos con:\n\n• PPF y WRAP\n• Body Kits y modificaciones estéticas\n• Iluminación y ambientación interior\n• Sistemas multimedia con Android Auto y Apple CarPlay\n• Polarizado\n• Equipamiento y accesorios off-road\n\nCuéntame, ¿qué vehículo tienes y qué te gustaría hacerle?\n\nSi tienes alguna fotografía o referencia de lo que buscas, puedes compartirla para orientarte mejor.',
+    '¡Hola! 👋 ¡Bienvenido a *GO TUNING GARAGE | PACHUCA* 🔧\n\nSoy *Ronin*, asistente virtual del taller. Estoy aquí para ayudarte a personalizar, proteger y equipar tu vehículo. 🏎️\n\nTrabajamos con:\n\n• PPF y WRAP\n• Body Kits y modificaciones estéticas\n• Iluminación y ambientación interior\n• Sistemas multimedia con Android Auto y Apple CarPlay\n• Polarizado\n• Equipamiento y accesorios off-road\n\nCuéntame, ¿qué vehículo tienes y qué te gustaría hacerle?\n\nSi tienes alguna fotografía o referencia de lo que buscas, puedes compartirla para orientarte mejor.\n\nAntes de continuar, ¿con quién tengo el gusto? 😎',
   noPriceReply:
     'Para darte una cotización correcta, primero necesitamos conocer tu vehículo y revisar exactamente lo que deseas realizar. En GO TUNING GARAGE hacemos una valoración gratuita y sin compromiso en nuestro taller; después de revisar tu proyecto podremos definir los materiales, el alcance del trabajo y presentarte una cotización adecuada.',
   valuationInvite:
@@ -207,6 +209,7 @@ function norm(s) {
 }
 
 const HAS = (text, words) => words.some((w) => norm(text).includes(norm(w)));
+
 /* Classify an inbound client message per the operative document + checklist §3.
  * Returns { category, needs_approval, reason, draft }.
  * Categories: greeting | service | price | scheduling | confirm | routine
@@ -311,6 +314,7 @@ function classify(text) {
     draft: BUSINESS.holdingReply,
   };
 }
+
 function extractText(msg) {
   if (!msg) return '';
   if (msg.type === 'text' && msg.text) return msg.text.body || '';
@@ -387,6 +391,7 @@ function graphGetMediaJson(mediaId) {
     req.end();
   });
 }
+
 // GET a URL as raw bytes, following up to 5 redirects (the temporary media
 // URL may redirect to a CDN host). Meta requires the same Bearer token on
 // the media download itself — without it the CDN answers 401. Rejects on
@@ -480,6 +485,7 @@ async function downloadInboundMedia(mediaId, messageId) {
   }
   return { ok: false, error: lastError };
 }
+
 /* Restricted automatic reply (TEST PHASE ONLY).
  * Runs only for inbound messages, only when the conversation's wa_id is in
  * AUTO_SEND_ALLOWLIST (checked first, before any send), and at most once
@@ -539,9 +545,9 @@ async function tryAutoReply(store, conv, inboundMsg, cls) {
       inboundMsg.auto_reply_at = new Date().toISOString();
       inboundMsg.auto_reply_message_id = mid;
       // Worker contract: record WHAT was auto-sent, so the hook worker can
-      // see it via GET /api/conversations and draft only the follow-up
-      // (greeting -> name question) instead of repeating the greeting.
-      // Holding cases get the full reply from the worker instead.
+      // see it via GET /api/conversations. The greeting already includes the
+      // name question, so for greetings the worker drafts nothing;
+      // holding cases get the full reply from the worker instead.
       inboundMsg.auto_sent_kind = cls.category === 'greeting' ? 'greeting' : 'holding';
       inboundMsg.auto_sent_text = text;
       inboundMsg.draft_status = 'sent';
@@ -566,6 +572,7 @@ async function tryAutoReply(store, conv, inboundMsg, cls) {
     console.error(new Date().toISOString(), 'AUTO-SEND error (draft stays pending, no retry):', String(e));
   }
 }
+
 async function handleInbound(store, value) {
   const contacts = {};
   (value.contacts || []).forEach((c) => {
@@ -680,6 +687,7 @@ async function sendWhatsApp(waId, text) {
     text: { preview_url: false, body: text },
   });
 }
+
 // Upload a local image file to Meta and return { status, body } where
 // body.id is the media id on success. multipart/form-data, v27.0.
 // The file is read from disk; the token is only ever sent to graph.facebook.com.
@@ -794,6 +802,7 @@ function sortedConversations(store) {
     }))
     .sort((a, b) => new Date(b.last_ts) - new Date(a.last_ts));
 }
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const pathname = url.pathname;
@@ -908,6 +917,7 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) return json(res, 500, { error: String(e) });
     }
   }
+
   if (pathname === '/api/draft' && req.method === 'POST') {
     const body = await readBody(req);
     if (!authorized(req, body)) return json(res, 401, { error: 'unauthorized' });
@@ -972,6 +982,7 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent) return json(res, 500, { error: String(e) });
     }
   }
+
   // ---- Outgoing image drafts (reference photos for clients) ----
   // POST /api/draft-image {key, wa_id, message_id, image_url, caption}
   // Fetches a web image into media/outgoing/ and records it as a held
@@ -1028,6 +1039,7 @@ const server = http.createServer(async (req, res) => {
     saveStore(store);
     return json(res, 200, { ok: true, file: rel, bytes: dl.buffer.length, mime: mime });
   }
+
   // POST /api/approve-image {key, wa_id, message_id}
   // Uploads the stored image draft to Meta and sends it as an image
   // message replying to message_id. Only acts when explicitly called.
@@ -1077,6 +1089,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 500, { error: String(e) });
     }
   }
+
   if (pathname === '/api/mark-read' && req.method === 'POST') {
     const body = await readBody(req);
     if (!authorized(req, body)) return json(res, 401, { error: 'unauthorized' });
